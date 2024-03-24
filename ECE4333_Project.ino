@@ -43,13 +43,21 @@
 #define K_D 4.0
 #define K_I 4.0
 
+#define K_P_OA1 0.37
+#define K_P_OA2 1.5
+#define K_D_OA 0.4
+
 #define TURN_TIME 1500
-#define SCAN_TIME 5000
 #define STOP_TIME 3000
 #define PICKUP_TOTAL 2800
 #define MIDDLE_IR_TOL 500
 
 #define TURN_SPEED 60
+#define TURN_ANGLE 70
+#define MOVE_SPEED_OA 60                    // This is the baseline velocity of the motors, onto which a mot_diff_speed will be added/subtracted during object avoidance
+
+#define DISTANCE_OA 20                      // The distance that will trigger object avoidance mode
+#define DISTANCE_SP 20                      // The setpoint (desired) distance between the robot and the obstacle during object avoidance mode
 
 #define SPEED_OF_SOUND 343
 #define ULTRASONIC_TIMEOUT 10000
@@ -67,7 +75,8 @@
 enum state {
     picked_up,
     line_tracking,
-    object_avoiding,
+    object_avoiding_1,
+    object_avoiding_2,
     searching,
     stop_sign
 };
@@ -88,6 +97,7 @@ uint32_t object_pixel_x, object_pixel_y, object_pixel_position, object_pixel_wid
 
 // Motor speeds
 int mot_rght_speed = 0, mot_left_speed = 0;
+int mot_diff_speed = 0;                       // The difference between motor speed and the baseline velocity during obstacle avoidance
 float value;
 float rightvalue;
 float finalvalue;
@@ -97,11 +107,11 @@ float start_time;
 bool first = true;
 float timestamp_OA;
 int timer1, timer2;
-int timer_OA0, timer_OA1, timer_OA2;
+int timer_OA0, timer_OA1, timer_OA2;s
 
 // Line tracking stuff
 int line_left, line_mdle, line_rght;
-bool turn_right = true;
+bool turn_right = false;
 
 // PID loop stuff
 float control_action, error, sum, prev_error;
@@ -110,24 +120,19 @@ int process_start_time;
 // State stuff
 state current_state = line_tracking;
 CRGB leds[NUM_LEDS];
-bool occupied = false;
+bool occupied = false;        // Flag to indicate if a time-consuming task is happenning (such as object avoidance)
 
-// scanning state
-int progress;
-int scan_angle_min = 45, scan_angle_max = 135;
 
 // Ultrasonic sensor stuff
-float distance, fly_time, pulse_time;
+float distance, distance_prev, distance_delta, distance_error;
+float fly_time, pulse_time;
 bool pulse_sent = false;
 
 bool clear_area_found = false; // Flag to indicate if a clear area is found
 int clear_direction = 0; // D
 bool check = false;
 float duration;
-float distance_OA = 30;
 bool first_OA = true;
-int object_avoiding_stage;
-int distance_sp = 20;
 
 // IMU stuff
 MPU6050_getdata AppMPU6050getdata;
@@ -220,30 +225,33 @@ void loop() {
           if(detected_object == STOP_SIGN) {
               current_state = stop_sign;
           } else if(detected_object == BEAR || detected_object == BULLDOZER) {
-              current_state = object_avoiding;
+              current_state = object_avoiding_1;
           }
       }
 
-      if (distance < distance_OA)
-          current_state = object_avoiding;
+      if (distance < DISTANCE_OA)
+          current_state = object_avoiding_1;
     }
     
     if (line_left + line_mdle + line_rght > PICKUP_TOTAL) {
       current_state = picked_up;
     }
+
     // ----------------- Checkpoint ------------------------- //
     // Serial.println(yaw);
-    // Serial.println(distance);
-    // Serial.println(line_mdle);
+    Serial.print(distance); Serial.print(" | ");
+    // Serial.print(line_left); Serial.print(" | ");
+    // Serial.print(line_mdle); Serial.print(" | ");
+    // Serial.print(line_rght); Serial.print(" | ");
     // Serial.println(line_left+line_mdle+line_rght);
     // Serial.println(current_state);
+    // Serial.print(current_state); Serial.print(" | "); Serial.print(line_left + line_mdle + line_rght); Serial.print(" | ");
 
-    Serial.print(current_state); Serial.print(" | "); Serial.print(line_left + line_mdle + line_rght); Serial.print(" | ");
     // ------------------ State Machine  ------------------ 
     // Do actions based on current state and check if we need to move to a new state
     switch(current_state) {
         case picked_up:
-            Serial.print("Pickd | ");
+            Serial.print("PickedUp | ");
             mot_rght_speed = 0;
             mot_left_speed = 0;
             servo_angle = 90;
@@ -264,121 +272,66 @@ void loop() {
             servo_angle = 90;
 
             leds[0] = CRGB::LINE_TRACKING_COLOR;
-            Serial.print("Track | ");
+            Serial.print("Tracking | ");
             break;
 
-        case object_avoiding: // Detected object that we want to avoid, so we move around it
-            // mot_rght_speed = 0;
-            // mot_left_speed = 0;
-
+        case object_avoiding_1: // Turning the car toward the outside of the track while rotating the servo in the opposite direction
             if (first_OA) {
-              object_avoiding_stage = 1;
               first_OA = false;
               occupied = true;
-              yaw_init = yaw;-
-
-              timer_OA0 = millis();
+              yaw_init = yaw;
+              // timer_OA0 = millis();
             }
 
-            // Scanning for a clear path
-            if (object_avoiding_stage == 1) {
-              if (millis() - timestamp_OA > 200) { // Quick stop before scanning
-                progress = millis() - timestamp_OA;
-                servo_angle = map(progress,0,SCAN_TIME,scan_angle_min,scan_angle_max);
-                distance = returnDistance();
-              }
-              else {
-                mot_rght_speed = 0;
-                mot_left_speed = 0;
-              }
+            mot_left_speed = -TURN_SPEED * pow(-1,turn_right);
+            mot_rght_speed = +TURN_SPEED * pow(-1,turn_right);
 
-              if (distance > 50){
-                // servo_angle = 90;
-                servo_diff = servo_angle - 90;
-                object_avoiding_stage = 2;
-                timer1 = millis();
-              }
+            // mot_left_speed = +TURN_SPEED;
+            // mot_rght_speed = -TURN_SPEED;
+            yaw_diff = yaw - yaw_init;
+
+            if (abs(yaw_diff) < TURN_ANGLE) {
+              servo_angle = 90 + yaw_diff/TURN_ANGLE * 85;
             }
-            // Following the clear path, the speed of the motor depends on the angle of the servo at which it finds the clear path
-            // If the robot sees a clear path at servo_angle = 45, veer strongly to the right. If clear path at servo_angle = 135, veer strongly to the left
-            else if (object_avoiding_stage == 2) {
-              yaw_diff = yaw - yaw_init;
-              
-              // distance = returnDistance();
-              // mot_rght_speed = min(50 - 2.5*(distance_sp-distance),150);
-              // mot_left_speed = 50;
-              
-              mot_rght_speed = map(servo_diff,scan_angle_min - 90,scan_angle_max-90,TURN_SPEED,TURN_SPEED*4);
-              mot_left_speed = map(servo_diff,scan_angle_min - 90,scan_angle_max-90,TURN_SPEED*4,TURN_SPEED);
-              servo_angle = 90 + 1.8*yaw_diff;
-              timer2 = millis();
-              if (abs(yaw_diff) > 45 && (timer2 - timer1 > 500)) {
-                object_avoiding_stage = 3;
-              }
+            else {
+              servo_angle = max(min(servo_angle,175),5);
+              distance_prev = distance;                       // Record the current distance as the previous distance PD control of object avoidance
+              current_state = object_avoiding_2;
             }
 
-            else if (object_avoiding_stage == 3) {
-              servo_angle > 180 ? 180 : servo_angle;
-              servo_angle < 0 ? 0 : servo_angle;
-              yaw_diff = yaw - yaw_init;
-              mot_rght_speed = map(yaw_diff,-45,45,TURN_SPEED,TURN_SPEED*2.5);
-              mot_left_speed = map(yaw_diff,-45,45,TURN_SPEED*2.5,TURN_SPEED);
-              
-              if (abs(yaw_diff) < 5) {
-                object_avoiding_stage = 4;
-              }
-            }
-
-            // Going straight until obstacle is no longer detected
-            else if (object_avoiding_stage == 4) {
-              yaw_diff = yaw - yaw_init;
-              mot_rght_speed = 150;
-              mot_left_speed = 150;
-              // distance = returnDistance();
-
-              if (distance > 30) {
-                object_avoiding_stage = 5;
-                timer1 = millis();
-              }
-            }
-
-            else if (object_avoiding_stage == 5) {
-              yaw_diff = yaw - yaw_init;
-              // mot_rght_speed = map(yaw_diff-45,-45,45,TURN_SPEED*2.5,TURN_SPEED);
-              // mot_left_speed = map(yaw_diff-45,-45,45,TURN_SPEED,TURN_SPEED*2.5);
-
-              mot_rght_speed = map(servo_diff,scan_angle_min - 90,scan_angle_max-90,TURN_SPEED*2,TURN_SPEED);
-              mot_left_speed = map(servo_diff,scan_angle_min - 90,scan_angle_max-90,TURN_SPEED,TURN_SPEED*2);
-              distance = returnDistance();
-
-              timer2 = millis();
-              if (abs(yaw_diff) > 45 && (timer2 - timer1 > 500)) {
-                object_avoiding_stage = 6;
-              }
-            }
-            else if (object_avoiding_stage == 6) {
-
-              if (line_mdle > MIDDLE_IR_TOL) {
-                  occupied = false;
-                  first_OA = true;
-                  current_state = line_tracking;
-                  break;
-              }
-              else {
-                servo_angle = 90;
-                // mot_rght_speed = map(yaw_diff,scan_angle_min - 90,scan_angle_max-90,TURN_SPEED,TURN_SPEED*2);
-                // mot_left_speed = map(yaw_diff,scan_angle_min - 90,scan_angle_max-90,TURN_SPEED*2,TURN_SPEED);
-                mot_rght_speed = 100;
-                mot_left_speed = 100;
-              }
-            }
-
-
-            // Once done, set occupied to false to allow for other state transitions
-            // first_OA = true;
-            // occupied = false;
             leds[0] = CRGB::OBJECT_AVOIDING_COLOR;
-            Serial.print("Avoid | "); Serial.print(object_avoiding_stage);
+            Serial.print("Avoid(1) | ");
+            break;
+
+        case object_avoiding_2: 
+            distance_delta = distance_prev - distance;
+            distance_delta = max(min(distance_delta,300),-300);
+            distance_error = DISTANCE_SP - distance;
+            distance_error = max(min(distance_error,100),-100); // Clampping the error for more preditability of ultrasonic reading (sometime spikes to >1100 cm)
+            
+            if (distance_error < 0) {
+              mot_diff_speed = K_P_OA1 * distance_error + K_D_OA * distance_delta; // PD control of the motor speed
+            }
+            else {
+              mot_diff_speed = K_P_OA2 * distance_error + K_D_OA * distance_delta; // PD control of the motor speed
+            }
+            
+            // mot_diff_speed = K_P_OA * distance_error; // P control of the motor speed
+            distance_prev = distance;
+
+            mot_left_speed = MOVE_SPEED_OA - mot_diff_speed * pow(-1,turn_right);
+            mot_rght_speed = MOVE_SPEED_OA + mot_diff_speed * pow(-1,turn_right);
+
+            // mot_left_speed = MOVE_SPEED_OA + mot_diff_speed;
+            // mot_rght_speed = MOVE_SPEED_OA - mot_diff_speed;
+
+            if (line_mdle > MIDDLE_IR_TOL) {
+              first_OA = true;
+              occupied = false;
+              current_state = line_tracking;
+            }
+            leds[0] = CRGB::OBJECT_AVOIDING_COLOR;
+            Serial.print("Avoid(2) | ");
             break;
 
         case searching: // No object is found, move the servo around to look for an object and move forward every now and then
@@ -423,7 +376,7 @@ void loop() {
             //     }
             // }
             leds[0] = CRGB::SEARCHING_COLOR;
-            Serial.print("Serch | ");
+            Serial.print("Searchin | ");
             break;
 
         
@@ -446,7 +399,7 @@ void loop() {
 
             // LED indication
             leds[0] = CRGB::STOP_SIGN_COLOR;
-            Serial.print("Stopp | ");
+            Serial.print("Stopped | ");
             break;
 
 
@@ -455,12 +408,14 @@ void loop() {
             mot_left_speed = 0;
             servo_angle = 90;
             leds[0] = CRGB::NO_STATE_COLOR;
-            Serial.print("Deflt | ");
+            Serial.print("Defaultt | ");
             break;
 
     }
     // Serial.print(current_state); Serial.print(" | "); Serial.println(line_left+line_mdle+line_rght);
-    // Serial.print(mot_left_speed); Serial.print(" | "); Serial.println(mot_rght_speed);
+    mot_left_speed = max(min(mot_left_speed,255),-255);
+    mot_rght_speed = max(min(mot_rght_speed,255),-255);
+    // Serial.print(mot_left_speed); Serial.print(" | "); Serial.print(mot_rght_speed);
     Serial.println("");
 
 
